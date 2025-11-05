@@ -290,6 +290,24 @@ class SGLangEngine(RayActor):
             "update_weights_from_distributed",
             payload,
         )
+        
+    def update_weights_from_p2p(
+        self, names, dtypes, shapes, send_ranks, group_name, flush_cache=False, weight_version: Optional[str] = None
+    ):
+        payload = {
+            "names": names,
+            "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
+            "shapes": shapes,
+            "send_ranks": send_ranks,
+            "group_name": group_name,
+            "flush_cache": flush_cache,
+        }
+        if weight_version is not None:
+            payload["weight_version"] = weight_version
+        return self._make_request(
+            "update_weights_from_p2p",
+            payload,
+        )
 
     def pause_generation(self):
         return requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})

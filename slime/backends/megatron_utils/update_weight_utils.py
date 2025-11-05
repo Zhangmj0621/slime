@@ -789,6 +789,217 @@ class UpdateWeightFromDistributed:
         ray.get(self.rollout_engine_lock.release.remote())
         pbar.update(1)
 
+class UpdateWeightFromP2p:
+    """
+    Update distributed engines via NCCL. Each PP rank: group "slime-pp_{pp_rank}",
+    only DP=TP=0 broadcasts. Non-expert (TP) and expert (EP) params separate.
+    """
+
+    def __init__(
+        self,
+        args: Namespace,
+        model: Sequence[torch.nn.Module],
+        weights: Mapping[str, Mapping[str, torch.Tensor]],
+        *,
+        model_name: str,
+        quantization_config: dict[str, int | str | list[str]] | None,
+        vocab_size: int,
+    ) -> None:
+        """
+        Initialize. Groups created in connect_rollout_engines.
+        """
+        self.args = args
+        self.model = model
+        self.model_name = model_name
+        self.vocab_size = vocab_size
+        self.quantization_config = quantization_config
+        self.weight_version = 0
+        self._model_update_groups = None
+
+    def connect_rollout_engines(
+        self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
+    ) -> None:
+        """
+        Create NCCL "slime-pp_{pp_rank}" if PP source (DP=TP=0). Lock prevents concurrent broadcasts.
+        """
+        self.rollout_engines = rollout_engines
+        self.rollout_engine_lock = rollout_engine_lock
+
+        # Make sure only one rank per PP stage call update_weights_from_p2p api to sglang engine
+        self._is_pp_src_rank = (
+            mpu.get_data_parallel_rank(with_context_parallel=True) == 0 
+            and mpu.get_tensor_model_parallel_rank() == 0
+        )
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        
+        # In p2p mode, each training rank in each pp_stage should connect to sglang engine in pp_stage group
+        self._group_name = f"slime-pp_{pp_rank}"
+
+        if self._model_update_groups is not None:
+            disconnect_rollout_engines_from_p2p(
+                self.args, self._group_name, self._model_update_groups, self.rollout_engines, self._is_pp_src_rank
+            )
+        self._model_update_groups = connect_rollout_engines_from_p2p(
+            self.args, self._group_name, rollout_engines, self._is_pp_src_rank
+        )
+
+    @torch.no_grad()
+    def update_weights(self) -> None:
+        """
+        Pause → flush → non-expert (TP) → expert (EP) → continue. Progress on PP source.
+        """
+        self.weight_version += 1
+
+        if dist.get_rank() == 0:
+            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+        dist.barrier(group=get_gloo_group())
+
+        buffer_size = 0
+        converted_named_tensors = []
+        # non expert params
+        pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
+
+        for name, param in named_parameters(self.args, self.model):
+            if ".experts." in name:
+                continue
+            buffer_size = self._update_weight_from_p2p(
+                name, param, converted_named_tensors, buffer_size, pbar=pbar
+            )
+
+        if converted_named_tensors:
+            self._update_bucket_weights_from_p2p(converted_named_tensors, pbar=pbar)
+
+        dist.barrier(group=get_gloo_group())
+
+        buffer_size = 0
+        named_tensors = []
+        for name, param in named_parameters(self.args, self.model):
+            if ".experts." not in name:
+                continue
+            buffer_size = self._update_expert_weight_from_p2p(
+                name, param, named_tensors, buffer_size, pbar=pbar
+            )
+
+        if named_tensors:
+            self._update_expert_bucket_weights_from_p2p(named_tensors, pbar=pbar)
+
+        dist.barrier(group=get_gloo_group())
+        if dist.get_rank() == 0:
+            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+        dist.barrier(group=get_gloo_group())
+
+    def _update_weight_from_p2p(
+        self,
+        name: str,
+        param: torch.nn.Parameter,
+        converted_named_tensors: list[tuple[str, torch.Tensor]],
+        buffer_size: int,
+        pbar: tqdm | None = None,
+    ) -> int | None:
+        """
+        Non-expert: gather TP → rm pad → HF → buffer (flush if full). All gather, PP source buffers.
+        Returns updated bytes on source, None on non-source.
+        """
+        param = all_gather_param(name, param)
+        param = remove_padding(name, param, self.vocab_size)
+
+        param_size = param.numel() * param.element_size()
+        if buffer_size + param_size > self.args.update_weight_buffer_size:
+            self._update_bucket_weights_from_p2p(converted_named_tensors, pbar=pbar)
+            buffer_size = 0
+        converted_named_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+        buffer_size += param_size
+        return buffer_size
+
+    def _update_expert_weight_from_p2p(
+        self,
+        name: str,
+        param: torch.nn.Parameter,
+        named_tensors: list[tuple[str, torch.Tensor]],
+        buffer_size: int,
+        pbar: tqdm | None = None,
+    ) -> int:
+        """
+        Expert: gather TP → rm pad → buffer. EP gather + HF deferred. Threshold × EP size.
+        """
+        param = all_gather_param(name, param)
+        param = remove_padding(name, param, self.vocab_size)
+
+        param_size = param.numel() * param.element_size()
+        if (
+            buffer_size + param_size
+        ) * mpu.get_expert_model_parallel_world_size() > self.args.update_weight_buffer_size:
+            self._update_expert_bucket_weights_from_p2p(named_tensors, pbar=pbar)
+            buffer_size = 0
+
+        named_tensors.append((name, param))
+        buffer_size += param_size
+        return buffer_size
+
+    def _update_expert_bucket_weights_from_p2p(
+        self, named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
+    ) -> None:
+        """
+        Gather EP → HF → broadcast. Clears buffer.
+        """
+        names = [name for name, _ in named_tensors]
+        all_names = [None] * mpu.get_expert_model_parallel_world_size()
+        dist.all_gather_object(all_names, names, group=mpu.get_expert_model_parallel_group())
+
+        for names in all_names:
+            assert len(named_tensors) == len(names), f"mismatch names length: {len(named_tensors)} != {len(names)}"
+
+        all_gathered_params = [[] for _ in range(mpu.get_expert_model_parallel_world_size())]
+        handles = []
+        for i, (name, param) in enumerate(named_tensors):
+            params = [
+                torch.empty_like(param.data, device=torch.cuda.current_device())
+                for _ in range(mpu.get_expert_model_parallel_world_size())
+            ]
+            handle = dist.all_gather(params, param.data, group=mpu.get_expert_model_parallel_group(), async_op=True)
+            handles.append(handle)
+            for ep_rank, names in enumerate(all_names):
+                all_gathered_params[ep_rank].append((names[i], params[ep_rank]))
+        for handle in handles:
+            handle.wait()
+
+        named_tensors.clear()
+
+        all_gathered_params = sum(all_gathered_params, [])
+        converted_hf_tensors = []
+        for name, param in all_gathered_params:
+            converted_hf_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+
+        self._update_bucket_weights_from_p2p(converted_hf_tensors, pbar)
+
+    def _update_bucket_weights_from_p2p(
+        self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
+    ) -> None:
+        """
+        only pp_src rank Lock → p2p → clear(refs success mean every rank in pp_stage success) → unlock → pbar++. Lock prevents NCCL deadlock.
+        """
+        # lock the rollout engines to prevent dead lock on broadcast.
+        if self._is_pp_src_rank:
+            while not ray.get(self.rollout_engine_lock.acquire.remote()):
+                time.sleep(0.1)
+
+        refs = update_weights_from_p2p(
+            self.args,
+            self._group_name,
+            self._model_update_groups,
+            self.weight_version,
+            self.rollout_engines,
+            converted_named_tensors,
+        )
+
+        if self._is_pp_src_rank:
+            ray.get(refs)
+        converted_named_tensors.clear()
+        if self._is_pp_src_rank:
+            ray.get(self.rollout_engine_lock.release.remote())
+            pbar.update(1)
+
 
 def connect_rollout_engines_from_distributed(
     args: Namespace, group_name: str, rollout_engines: Sequence[ActorHandle]
@@ -832,6 +1043,108 @@ def disconnect_rollout_engines_from_distributed(args, group_name, model_update_g
     dist.destroy_process_group(model_update_groups)
     ray.get(refs)
 
+def connect_rollout_engines_from_p2p(
+    args: Namespace, 
+    group_name: str, 
+    rollout_engines: Sequence[ActorHandle], 
+    _is_pp_src_rank: bool,
+) -> dist.ProcessGroup:
+    """
+    Create NCCL group: training rank in each pp stage + all engine GPUs. Blocks until joined.
+    
+    This Function has following behaviors:
+    First, create a gloo group for broadcasting TCP rendezvous information.
+    
+    Then, depending on the value of _is_pp_src_rank, it performs different actions:
+    1. If _is_pp_src_rank is True
+    - This rank acts as the master rank (rank 0) for the NCCL process group.
+    - It generates and broadcasts TCP rendezvous
+    - It initializes the NCCL process group including itself and all rollout engines.
+    - All ranks and rollout engines join the group.
+    
+    2. If _is_pp_src_rank is False
+    - This rank acts as a worker rank in the NCCL process group.
+    - It receives the TCP rendezvous information from the master rank.
+    - It initializes the NCCL process group as a worker rank.
+    
+    Args:
+        args (Namespace): The arguments namespace containing configuration parameters.
+        group_name (str): The name of the NCCL process group.
+        rollout_engines (Sequence[ActorHandle]): A sequence of Ray actor handles representing the rollout engines.
+        _is_pp_src_rank (bool): Whether the current rank is the PP source rank.
+        
+    Returns:
+        dist.ProcessGroup: The initialized NCCL process group.
+    """
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    my_pp_stage = dist.get_rank() // (dist.get_world_size() // pp_size)
+
+    # create gloo group for each pp stage
+    for pp_stage in range(pp_size):
+        ranks_in_stage = list(range(pp_stage * 16, (pp_stage+1) * 16))
+
+        group = dist.new_group(ranks = ranks_in_stage, backend = "gloo")
+
+        if pp_stage == my_pp_stage:
+            my_pp_stage_group = group
+            my_pp_stage_rank_0 = pp_stage * 16
+
+    if _is_pp_src_rank:
+        master_address = ray._private.services.get_node_ip_address()
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            master_port = sock.getsockname()[1]
+
+        object_to_broadcast = [master_address, master_port]
+
+        print(f"[Rank {dist.get_rank()}] In PP Stage {my_pp_stage}, I am the leader. Broadcasting: {object_to_broadcast}")
+    else:
+        object_to_broadcast = [None, None]
+
+    # blocking broadcast master_address and master_port to all ranks
+    dist.broadcast_object_list(
+        object_list=object_to_broadcast,
+        src=my_pp_stage_rank_0,
+        group=my_pp_stage_group,
+    )
+
+    # directly destroy process group since it has no other use
+    dist.destory_process_group(group=my_pp_stage_group)
+
+    master_address, master_port = object_to_broadcast
+    world_size = len(rollout_engines) * args.rollout_num_gpus_per_engine + (dist.get_world_size() // pp_size)
+
+    refs = [
+        engine.init_weights_update_group.remote(
+            master_address,
+            master_port,
+            i * args.rollout_num_gpus_per_engine + (dist.get_world_size() // pp_size),
+            world_size,
+            group_name,
+            backend="nccl",
+        )
+        for i, engine in enumerate(rollout_engines)
+    ]
+    model_update_groups = init_process_group(
+        backend="nccl",
+        init_method=f"tcp://{master_address}:{master_port}",
+        world_size=world_size,
+        rank=dist.get_rank()-my_pp_stage_rank_0,
+        group_name=group_name,
+    )
+    ray.get(refs)
+    return model_update_groups
+
+def disconnect_rollout_engines_from_p2p(args, group_name, model_update_groups, rollout_engines, _is_pp_src_rank):
+    """
+    Destroy NCCL on training and engines.
+    """
+    if _is_pp_src_rank:
+        refs = [engine.destroy_weights_update_group.remote(group_name) for engine in rollout_engines]
+        dist.destroy_process_group(model_update_groups)
+        ray.get(refs)
+    else:
+        dist.destroy_process_group(model_update_groups)
 
 def update_weights_from_distributed(
     args: Namespace,
@@ -856,9 +1169,62 @@ def update_weights_from_distributed(
     ]
 
     handles = []
+    start_time = time.monotonic()
+        
     for _, param in converted_named_tensors:
         handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))
     for handle in handles:
         handle.wait()
+    end_time = time.monotonic()
+    elapsed_time = end_time - start_time
+    print(f"[Rank {dist.get_rank()}] Broadcast {len(converted_named_tensors)} tensors took {elapsed_time:.4f} seconds.")
 
     return refs
+
+def update_weights_from_p2p(
+    args: Namespace,
+    group_name: str,
+    group: dist.ProcessGroup,
+    weight_version: int,
+    rollout_engines: Sequence[ActorHandle],
+    converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
+) -> list[ObjectRef]:
+    """
+    Send metadata (Ray), p2p send tensors (round-robin send).
+    """
+    total_rollout_gpus = args.rollout_num_gpus_per_engine * len(rollout_engines)
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    pp_stage_size = (dist.get_world_size() // pp_size)
+    my_pp_stage_rank = dist.get_rank() % pp_stage_size
+    send_ranks = [0] * (total_rollout_gpus + pp_stage_size)
+    my_dst_rank = [] 
+    
+    pp_stage_send_rank = 0
+    for rollout_engine_rank in range(pp_stage_size, total_rollout_gpus + pp_stage_size):
+        send_ranks[rollout_engine_rank] = pp_stage_send_rank
+        if pp_stage_send_rank == my_pp_stage_rank:
+            my_dst_rank.append(rollout_engine_rank)
+        pp_stage_send_rank = (pp_stage_send_rank + 1) % pp_stage_size
+
+    if my_pp_stage_rank == 0:
+        refs = [
+            engine.update_weights_from_p2p.remote(
+                names=[name for name, _ in converted_named_tensors],
+                dtypes=[param.dtype for _, param in converted_named_tensors],
+                shapes=[param.shape for _, param in converted_named_tensors],
+                send_ranks=send_ranks,
+                group_name=group_name,
+                weight_version=str(weight_version),
+            )
+            for engine in rollout_engines
+        ]
+
+    handles = []
+
+    for _, param in converted_named_tensors:
+        for dst_rank in my_dst_rank:
+            handles.append(dist.isend(param.data, dst=dst_rank, group=group))
+    for handle in handles:
+        handle.wait()
+
+    return refs if my_pp_stage_rank ==0 else None

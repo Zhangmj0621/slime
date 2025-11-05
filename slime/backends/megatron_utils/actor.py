@@ -32,7 +32,7 @@ from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_da
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
-from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor, named_parameters
+from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor, named_parameters, UpdateWeightFromP2p
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -93,7 +93,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.weights["rollout_actor"] = {}
                 self.update_cpu_params_dict(self.weights["rollout_actor"])
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromP2p
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,
