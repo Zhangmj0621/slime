@@ -1114,17 +1114,18 @@ def connect_rollout_engines_from_p2p(
     master_address, master_port = object_to_broadcast
     world_size = len(rollout_engines) * args.rollout_num_gpus_per_engine + (dist.get_world_size() // pp_size)
 
-    refs = [
-        engine.init_weights_update_group.remote(
-            master_address,
-            master_port,
-            i * args.rollout_num_gpus_per_engine + (dist.get_world_size() // pp_size),
-            world_size,
-            group_name,
-            backend="nccl",
-        )
-        for i, engine in enumerate(rollout_engines)
-    ]
+    if _is_pp_src_rank:
+        refs = [
+            engine.init_weights_update_group.remote(
+                master_address,
+                master_port,
+                i * args.rollout_num_gpus_per_engine + (dist.get_world_size() // pp_size),
+                world_size,
+                group_name,
+                backend="nccl",
+            )
+            for i, engine in enumerate(rollout_engines)
+        ]
     model_update_groups = init_process_group(
         backend="nccl",
         init_method=f"tcp://{master_address}:{master_port}",
