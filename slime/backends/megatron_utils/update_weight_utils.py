@@ -642,35 +642,52 @@ class UpdateWeightFromDistributed:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
+        
+        def trace_handler(prof):
+            prof.export_chrome_trace("/workspace/infrawaves/profiling/slime_grank_" + 
+                                 str(torch.distributed.get_rank()) + ".json")
 
         buffer_size = 0
         converted_named_tensors = []
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
 
-        for name, param in named_parameters(self.args, self.model):
-            if ".experts." in name:
-                continue
-            buffer_size = self._update_weight_from_distributed(
-                name, param, converted_named_tensors, buffer_size, pbar=pbar
-            )
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=0,
+                warmup=0,
+                active=10,
+                repeat=1),
+            on_trace_ready=trace_handler
+        ) as p:
+            for name, param in named_parameters(self.args, self.model):
+                if ".experts." in name:
+                    continue
+                buffer_size = self._update_weight_from_distributed(
+                    name, param, converted_named_tensors, buffer_size, pbar=pbar
+                )
 
-        if converted_named_tensors:
-            self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+            if converted_named_tensors:
+                self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
 
-        dist.barrier(group=get_gloo_group())
+            dist.barrier(group=get_gloo_group())
 
-        buffer_size = 0
-        named_tensors = []
-        for name, param in named_parameters(self.args, self.model):
-            if ".experts." not in name:
-                continue
-            buffer_size = self._update_expert_weight_from_distributed(
-                name, param, named_tensors, buffer_size, pbar=pbar
-            )
+            buffer_size = 0
+            named_tensors = []
+            for name, param in named_parameters(self.args, self.model):
+                if ".experts." not in name:
+                    continue
+                buffer_size = self._update_expert_weight_from_distributed(
+                    name, param, named_tensors, buffer_size, pbar=pbar
+                )
 
-        if named_tensors:
-            self._update_expert_bucket_weights_from_distributed(named_tensors, pbar=pbar)
+            if named_tensors:
+                self._update_expert_bucket_weights_from_distributed(named_tensors, pbar=pbar)
+            p.step()
 
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
@@ -831,7 +848,7 @@ class UpdateWeightFromP2p:
             and mpu.get_tensor_model_parallel_rank() == 0
         )
         pp_rank = mpu.get_pipeline_model_parallel_rank()
-        
+
         # In p2p mode, each training rank in each pp_stage should connect to sglang engine in pp_stage group
         self._group_name = f"slime-pp_{pp_rank}"
 
@@ -839,7 +856,8 @@ class UpdateWeightFromP2p:
             disconnect_rollout_engines_from_p2p(
                 self.args, self._group_name, self._model_update_groups, self.rollout_engines, self._is_pp_src_rank
             )
-        self._model_update_groups = connect_rollout_engines_from_p2p(
+            dist.destroy_process_group(self._my_pp_stage_group)
+        self._model_update_groups, self._my_pp_stage_group = connect_rollout_engines_from_p2p(
             self.args, self._group_name, rollout_engines, self._is_pp_src_rank
         )
 
@@ -854,35 +872,52 @@ class UpdateWeightFromP2p:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
+        
+        def trace_handler(prof):
+            prof.export_chrome_trace("/workspace/infrawaves/profiling/slime_grank_" + 
+                                 str(torch.distributed.get_rank()) + ".json")
 
         buffer_size = 0
         converted_named_tensors = []
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
 
-        for name, param in named_parameters(self.args, self.model):
-            if ".experts." in name:
-                continue
-            buffer_size = self._update_weight_from_p2p(
-                name, param, converted_named_tensors, buffer_size, pbar=pbar
-            )
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=0,
+                warmup=0,
+                active=10,
+                repeat=1),
+            on_trace_ready=trace_handler
+        ) as p:
+            for name, param in named_parameters(self.args, self.model):
+                if ".experts." in name:
+                    continue
+                buffer_size = self._update_weight_from_p2p(
+                    name, param, converted_named_tensors, buffer_size, pbar=pbar
+                )
 
-        if converted_named_tensors:
-            self._update_bucket_weights_from_p2p(converted_named_tensors, pbar=pbar)
+            if converted_named_tensors:
+                self._update_bucket_weights_from_p2p(converted_named_tensors, pbar=pbar)
 
-        dist.barrier(group=get_gloo_group())
+            dist.barrier(group=get_gloo_group())
 
-        buffer_size = 0
-        named_tensors = []
-        for name, param in named_parameters(self.args, self.model):
-            if ".experts." not in name:
-                continue
-            buffer_size = self._update_expert_weight_from_p2p(
-                name, param, named_tensors, buffer_size, pbar=pbar
-            )
+            buffer_size = 0
+            named_tensors = []
+            for name, param in named_parameters(self.args, self.model):
+                if ".experts." not in name:
+                    continue
+                buffer_size = self._update_expert_weight_from_p2p(
+                    name, param, named_tensors, buffer_size, pbar=pbar
+                )
 
-        if named_tensors:
-            self._update_expert_bucket_weights_from_p2p(named_tensors, pbar=pbar)
+            if named_tensors:
+                self._update_expert_bucket_weights_from_p2p(named_tensors, pbar=pbar)
+            p.step()
 
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
@@ -983,6 +1018,8 @@ class UpdateWeightFromP2p:
         if self._is_pp_src_rank:
             while not ray.get(self.rollout_engine_lock.acquire.remote()):
                 time.sleep(0.1)
+                
+        dist.barrier(group=self._my_pp_stage_group)
 
         refs = update_weights_from_p2p(
             self.args,
@@ -995,6 +1032,7 @@ class UpdateWeightFromP2p:
 
         if self._is_pp_src_rank:
             ray.get(refs)
+        dist.barrier(group=self._my_pp_stage_group)
         converted_named_tensors.clear()
         if self._is_pp_src_rank:
             ray.get(self.rollout_engine_lock.release.remote())
@@ -1078,16 +1116,17 @@ def connect_rollout_engines_from_p2p(
     """
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     my_pp_stage = dist.get_rank() // (dist.get_world_size() // pp_size)
+    pp_stage_size = dist.get_world_size() // pp_size
 
     # create gloo group for each pp stage
     for pp_stage in range(pp_size):
-        ranks_in_stage = list(range(pp_stage * 16, (pp_stage+1) * 16))
+        ranks_in_stage = list(range(pp_stage * pp_stage_size, (pp_stage+1) * pp_stage_size))
 
         group = dist.new_group(ranks = ranks_in_stage, backend = "gloo")
 
         if pp_stage == my_pp_stage:
             my_pp_stage_group = group
-            my_pp_stage_rank_0 = pp_stage * 16
+            my_pp_stage_rank_0 = pp_stage * pp_stage_size
 
     if _is_pp_src_rank:
         master_address = ray._private.services.get_node_ip_address()
@@ -1109,7 +1148,8 @@ def connect_rollout_engines_from_p2p(
     )
 
     # directly destroy process group since it has no other use
-    dist.destory_process_group(group=my_pp_stage_group)
+    dist.barrier(group=my_pp_stage_group)
+    # dist.destroy_process_group(group=my_pp_stage_group)
 
     master_address, master_port = object_to_broadcast
     world_size = len(rollout_engines) * args.rollout_num_gpus_per_engine + (dist.get_world_size() // pp_size)
@@ -1133,8 +1173,10 @@ def connect_rollout_engines_from_p2p(
         rank=dist.get_rank()-my_pp_stage_rank_0,
         group_name=group_name,
     )
-    ray.get(refs)
-    return model_update_groups
+    if _is_pp_src_rank:
+        ray.get(refs)
+    dist.barrier(group=my_pp_stage_group)
+    return model_update_groups, my_pp_stage_group
 
 def disconnect_rollout_engines_from_p2p(args, group_name, model_update_groups, rollout_engines, _is_pp_src_rank):
     """
@@ -1195,13 +1237,20 @@ def update_weights_from_p2p(
     """
     total_rollout_gpus = args.rollout_num_gpus_per_engine * len(rollout_engines)
     pp_size = mpu.get_pipeline_model_parallel_world_size()
-    pp_stage_size = (dist.get_world_size() // pp_size)
+    pp_stage_size = dist.get_world_size() // pp_size
+    group_world_size = total_rollout_gpus + pp_stage_size
+    assert pp_stage_size > 0, "pp_stage_size must be > 0"
+
     my_pp_stage_rank = dist.get_rank() % pp_stage_size
-    send_ranks = [0] * (total_rollout_gpus + pp_stage_size)
+    assert my_pp_stage_rank < pp_stage_size, (
+        "update_weights_from_p2p should be called only on training ranks "
+        f"(my_pp_stage_rank={my_pp_stage_rank}, pp_stage_size={pp_stage_size})"
+    )
+    send_ranks = [-1] * (group_world_size)
     my_dst_rank = [] 
-    
+
     pp_stage_send_rank = 0
-    for rollout_engine_rank in range(pp_stage_size, total_rollout_gpus + pp_stage_size):
+    for rollout_engine_rank in range(pp_stage_size, group_world_size):
         send_ranks[rollout_engine_rank] = pp_stage_send_rank
         if pp_stage_send_rank == my_pp_stage_rank:
             my_dst_rank.append(rollout_engine_rank)
@@ -1222,6 +1271,7 @@ def update_weights_from_p2p(
 
     handles = []
 
+    
     for _, param in converted_named_tensors:
         for dst_rank in my_dst_rank:
             handles.append(dist.isend(param.data, dst=dst_rank, group=group))
