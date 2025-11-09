@@ -8,7 +8,7 @@ from slime.ray.rollout import RolloutManager
 class ParamMeta:
     original_name: str
     param_size: int 
-    
+
 def set_routing_table(
     actor_param_metadata: list[Dict[str, ParamMeta]],
     rollout_param_metadata: list[list[list[str]]],
@@ -19,7 +19,7 @@ def set_routing_table(
         actor_param_metadata (list[Dict[str, ParamMeta]]): Parameter metadata for actor workers.
         rollout_param_metadata (list[list[str]]): Parameter metadata for rollout workers.
     """
-    
+
     actor_worker_num = len(actor_param_metadata)
     rollout_engine_num = len(rollout_param_metadata)
     rollout_worker_num_per_engine = len(rollout_param_metadata[0])
@@ -27,7 +27,8 @@ def set_routing_table(
     routing_table = []
 
     # sendbytes of each actor worker
-    sendbytes_per_actor = [0 for _ in range(actor_worker_num)]
+    sendbytes_Non_MoE_per_actor = [0 for _ in range(actor_worker_num)]
+    sendbytes_MoE_per_actor = [0 for _ in range(actor_worker_num)]
 
     for engine_index in range(0, rollout_engine_num):
         engine_routing_table = []
@@ -42,18 +43,21 @@ def set_routing_table(
                     actor_param_meta_dict = actor_param_metadata[actor_worker_index]
                     if param_name in actor_param_meta_dict:
                         corresponding_actor_worker_list.append(actor_worker_index)
-                    
+
                 # choose the actor worker with the least sendbytes
-                chosen_actor_worker = min(
-                    corresponding_actor_worker_list, key=lambda idx: sendbytes_per_actor[idx]
-                )
+                # since we send MoE and Non-MoE parameters separately, we need to get sendbytes accordingly
                 param_size = actor_param_metadata[chosen_actor_worker][param_name].param_size
-                sendbytes_per_actor[chosen_actor_worker] += param_size
+                if ".experts." in param_name:
+                    chosen_actor_worker = min(
+                        corresponding_actor_worker_list, key=lambda idx: sendbytes_MoE_per_actor[idx]
+                    )
+                    sendbytes_MoE_per_actor[chosen_actor_worker] += param_size
+                else:
+                    chosen_actor_worker = min(
+                        corresponding_actor_worker_list, key=lambda idx: sendbytes_Non_MoE_per_actor[idx]
+                    )
+                    sendbytes_Non_MoE_per_actor[chosen_actor_worker] += param_size
                 worker_routing_table[param_name] = [chosen_actor_worker, actor_param_metadata[chosen_actor_worker][param_name].original_name]
             engine_routing_table.append(worker_routing_table)
         routing_table.append(engine_routing_table)
     return routing_table
-            
-
-        
-    
