@@ -958,42 +958,29 @@ class UpdateWeightFromP2p:
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
 
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(
-                wait=0,
-                warmup=0,
-                active=10,
-                repeat=1),
-            on_trace_ready=trace_handler
-        ) as p:
-            for name, param in named_parameters(self.args, self.model):
-                if ".experts." in name:
-                    continue
-                buffer_size = self._update_weight_from_p2p(
-                    name, param, converted_named_tensors, buffer_size, pbar=pbar
-                )
+        for name, param in named_parameters(self.args, self.model):
+            if ".experts." in name:
+                continue
+            buffer_size = self._update_weight_from_p2p(
+                name, param, converted_named_tensors, buffer_size, pbar=pbar
+            )
 
-            if converted_named_tensors:
-                self._update_bucket_weights_from_p2p(converted_named_tensors, pbar=pbar)
+        if converted_named_tensors:
+            self._update_bucket_weights_from_p2p(converted_named_tensors, pbar=pbar)
 
-            dist.barrier(group=get_gloo_group())
+        dist.barrier(group=get_gloo_group())
 
-            buffer_size = 0
-            named_tensors = []
-            for name, param in named_parameters(self.args, self.model):
-                if ".experts." not in name:
-                    continue
-                buffer_size = self._update_expert_weight_from_p2p(
-                    name, param, named_tensors, buffer_size, pbar=pbar
-                )
+        buffer_size = 0
+        named_tensors = []
+        for name, param in named_parameters(self.args, self.model):
+            if ".experts." not in name:
+                continue
+            buffer_size = self._update_expert_weight_from_p2p(
+                name, param, named_tensors, buffer_size, pbar=pbar
+            )
 
-            if named_tensors:
-                self._update_expert_bucket_weights_from_p2p(named_tensors, pbar=pbar)
-            p.step()
+        if named_tensors:
+            self._update_expert_bucket_weights_from_p2p(named_tensors, pbar=pbar)
 
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
