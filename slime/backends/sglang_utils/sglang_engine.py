@@ -197,6 +197,18 @@ class SGLangEngine(RayActor):
             "update_weights_from_tensor",
             payload,
         )
+        
+    def get_param_metadata(self) -> list[list[str]]:
+        """
+        Get parameter metadata from the SGLang engine.
+        Each tp_worker has its own param metadata list.
+
+        Returns:
+            A list of parameter names.
+        """
+        payload = {}
+        response = self._make_request("get_param_metadata", payload)
+        return response
 
     def flush_cache(self):
         """Flush the cache of the server."""

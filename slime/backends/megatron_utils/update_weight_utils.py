@@ -4,6 +4,8 @@ import socket
 import time
 from argparse import Namespace
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Dict
 
 import ray
 import torch
@@ -18,10 +20,12 @@ try:
 except:
     from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from tqdm import tqdm
 
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.types import ParamInfo
+from slime.backends.megatron_utils.param_routing import ParamMeta
 
 from .megatron_to_hf import convert_to_hf  # noqa: F401
 
@@ -833,6 +837,78 @@ class UpdateWeightFromP2p:
         self.weight_version = 0
         self._model_update_groups = None
 
+    def get_param_metadata(self) -> Dict[str, ParamMeta]:
+        param_metadata_dict = {}
+
+        # need to do quantization
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+
+        for name, param in named_parameters(self.args, self.model):
+            original_name = name
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            for param_name, weight_name, _ in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if "mlp.experts" in name:
+                    continue
+                name = name.replace(param_name, weight_name)
+                break
+            else:
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, _, _ = mapping
+                    if weight_name not in name:
+                        continue
+
+                    name = name.replace(weight_name, param_name)
+                    break
+            paramSize = param.numel() * param.element_size() * mpu.get_tensor_model_parallel_world_size()
+            paramMeta = ParamMeta(original_name=original_name, param_size=paramSize)
+            param_metadata_dict[name] = paramMeta
+        return param_metadata_dict
+
+    def set_routing_table(self, routing_table) -> None:
+        # transition routing table
+        self.param_send_dst = {}
+        global_worker_idx = dist.get_rank()
+
+        rollout_engine_num = len(self.rollout_engines)
+        rollout_worker_num_per_engine = self.args.rollout_num_gpus_per_engine
+
+        for engine_idx in range(rollout_engine_num):
+            for worker_idx in range(rollout_worker_num_per_engine):
+                worker_routing_table = routing_table[engine_idx][worker_idx]
+
+                for _, param_metadata in worker_routing_table.items():
+                    chosen_actor_worker, original_param_name = param_metadata
+                    if chosen_actor_worker == global_worker_idx:
+                        if original_param_name not in self.param_send_dst:
+                            self.param_send_dst[original_param_name] = [[engine_idx, worker_idx]]
+                        else:
+                            self.param_send_dst[original_param_name].append([engine_idx, worker_idx])
+
     def connect_rollout_engines(
         self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
     ) -> None:
@@ -872,7 +948,7 @@ class UpdateWeightFromP2p:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
-        
+
         def trace_handler(prof):
             prof.export_chrome_trace("/workspace/infrawaves/profiling/slime_grank_" + 
                                  str(torch.distributed.get_rank()) + ".json")
@@ -1018,7 +1094,7 @@ class UpdateWeightFromP2p:
         if self._is_pp_src_rank:
             while not ray.get(self.rollout_engine_lock.acquire.remote()):
                 time.sleep(0.1)
-                
+
         dist.barrier(group=self._my_pp_stage_group)
 
         refs = update_weights_from_p2p(

@@ -33,6 +33,7 @@ from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor, named_parameters, UpdateWeightFromP2p
+from slime.backends.megatron_utils.param_routing import ParamMeta
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -376,6 +377,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.offload_train:
             destroy_process_groups()
+
+    def get_param_metadata(self) -> Dict[str, ParamMeta]:
+        return self.weight_updater.get_param_metadata()
+    
+    def set_routing_table(self, routing_table) -> None:
+        self.weight_updater.set_routing_table(routing_table)
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune

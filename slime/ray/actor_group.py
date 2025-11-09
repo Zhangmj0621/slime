@@ -122,6 +122,17 @@ class RayTrainGroup:
         """Save actor model on rank 0."""
         return ray.get([actor.save_model.remote(step_id) for actor in self._actor_handlers])
 
+    def get_param_metadata_lists(self):
+        return ray.get([actor.get_param_metadata.remote() for actor in self._actor_handlers])
+    
+    def set_actor_routing_table(self, routing_table):
+        ray.get(
+            [
+                actor.set_routing_table.remote(routing_table)
+                for actor in self._actor_handlers
+            ]
+        )
+
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
         return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])

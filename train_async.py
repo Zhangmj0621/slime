@@ -3,6 +3,7 @@ import ray
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.wandb_utils import init_wandb_primary
+from slime.backends.megatron_utils.param_routing import set_routing_table
 
 
 def train(args):
@@ -20,6 +21,14 @@ def train(args):
 
     # always update weight first so that sglang has the loaded weights from training.
     actor_model.update_weights()
+    
+    # get param_metadata of each actor worker
+    actor_param_metadata = actor_model.get_param_metadata_lists()
+    # get param_metadata of all worker in rollout engine
+    rollout_param_metadata = ray.get(rollout_manager.get_param_metadata_lists.remote())
+    
+    # set routing table
+    routing_table = set_routing_table(actor_param_metadata, rollout_param_metadata)
 
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
